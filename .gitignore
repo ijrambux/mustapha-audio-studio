@@ -33,3 +33,10 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Engine artifacts (large, local only)
+engines/**/checkpoints/
+engines/**/output/
+engines/**/.venv/
+engines/**/__pycache__/
+
