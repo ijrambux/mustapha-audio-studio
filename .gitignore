@@ -40,3 +40,7 @@ engines/**/output/
 engines/**/.venv/
 engines/**/__pycache__/
 
+
+# local engine artifacts and secrets
+.data/
+

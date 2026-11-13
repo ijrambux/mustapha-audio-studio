@@ -57,6 +57,11 @@ class ProcessAudioRequest(BaseModel):
     operation: str = Field(pattern="^(normalize|trim)$")
 
 
+class ExportProjectRequest(BaseModel):
+    project_id: str
+    format: str = Field(default="wav", pattern="^(wav|mp3)$")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -147,6 +152,45 @@ def get_project(project_id: str) -> dict[str, Any]:
     return load_project(project_id)
 
 
+@app.put("/projects/{project_id}")
+def update_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    project = load_project(project_id)
+    project.update(payload)
+    project["id"] = project_id
+    project["updated_at"] = now_iso()
+    if "assets" not in project:
+        project["assets"] = []
+    save_project(project)
+    return project
+
+class ExportProjectRequest(BaseModel):
+    project_id: str
+    format: str = Field(default="wav", pattern="^(wav|mp3)$")
+
+
+def probe_duration(path: Path) -> float | None:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        value = completed.stdout.strip()
+        return float(value) if value else None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
 @app.post("/uploads")
 async def upload_audio(file: UploadFile = File(...)) -> dict[str, Any]:
     file_id = str(uuid.uuid4())
@@ -160,6 +204,7 @@ async def upload_audio(file: UploadFile = File(...)) -> dict[str, Any]:
         "filename": file.filename,
         "path": str(destination),
         "size": destination.stat().st_size,
+        "duration": probe_duration(destination),
     }
 
 
@@ -327,6 +372,97 @@ def run_process_audio(job_id: str, input_path: Path, operation: str) -> None:
             )
         else:
             update_job(job_id, status="failed", progress=100, error=output[-2000:])
+    except Exception as exc:
+        update_job(job_id, status="failed", progress=100, error=str(exc))
+
+
+@app.post("/jobs/export-project")
+def export_project_job(request: ExportProjectRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    project = load_project(request.project_id)
+    job = new_job("export_project", {"project_id": request.project_id, "format": request.format})
+    background_tasks.add_task(run_export_project, job["id"], project, request.format)
+    return job
+def run_export_project(job_id: str, project: dict[str, Any], output_format: str) -> None:
+    update_job(job_id, status="running", progress=5)
+    output_dir = JOBS / job_id / "export"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"project-export.{output_format}"
+
+    tracks = project.get("tracks", [])
+    solo_exists = any(track.get("solo") for track in tracks)
+
+    inputs: list[str] = []
+    filter_parts: list[str] = []
+    mix_labels: list[str] = []
+
+    for track_index, track in enumerate(tracks):
+        for clip_index, clip in enumerate(track.get("clips", [])):
+            file_id = clip.get("file_id") or clip.get("fileId")
+            matches = [p for p in STORAGE.rglob(f"{file_id}.*") if p.is_file()]
+            if not matches:
+                continue
+            input_path = matches[0]
+            inputs.extend(["-i", str(input_path)])
+
+            start = float(clip.get("start", 0) or 0)
+            offset = float(clip.get("offset", 0) or 0)
+            duration = float(clip.get("duration", 0) or 0)
+            volume = float(track.get("volume", 1.0) or 1.0)
+            pan = float(track.get("pan", 0) or 0)
+            muted = bool(track.get("muted", False))
+            solo = bool(track.get("solo", False))
+
+            if muted or (solo_exists and not solo):
+                continue
+
+            delay_ms = int(start * 1000)
+            left_gain = max(0.0, min(1.0, 1.0 - max(0.0, pan)))
+            right_gain = max(0.0, min(1.0, 1.0 + min(0.0, pan)))
+            label = f"a{track_index}_{clip_index}"
+
+            filter_parts.append(
+                f"[{len(inputs)//2 - 1}:a]"
+                f"atrim=start={offset}:duration={duration},"
+                f"asetpts=PTS-STARTPTS,"
+                f"adelay={delay_ms}|{delay_ms},"
+                f"volume={volume},"
+                f"pan=stereo|c0={left_gain}*c0|c1={right_gain}*c1"
+                f"[{label}]"
+            )
+            mix_labels.append(f"[{label}]")
+
+    if not mix_labels:
+        update_job(job_id, status="failed", progress=100, error="No playable clips to export")
+        return
+
+    filter_complex = ";".join(filter_parts + [f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest:normalize=0[mix]"])
+    master_volume = float(project.get("master_volume", 1.0) or 1.0)
+    filter_complex += f";[mix]volume={master_volume}[final]"
+
+    command = ["ffmpeg", "-y"]
+    command.extend(inputs)
+    command.extend(["-filter_complex", filter_complex, "-map", "[final]", "-ar", "44100", "-ac", "2"])
+    if output_format == "mp3":
+        command.extend(["-codec:a", "libmp3lame", "-q:a", "2"])
+    command.append(str(output_path))
+
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        output = completed.stdout + "\n" + completed.stderr
+        if completed.returncode == 0 and output_path.exists():
+            update_job(
+                job_id,
+                status="succeeded",
+                progress=100,
+                result={
+                    "engine": "audio-engine",
+                    "output_file": str(output_path),
+                    "filename": output_path.name,
+                    "download_url": f"/files/{output_path.stem}",
+                },
+            )
+        else:
+            update_job(job_id, status="failed", progress=100, error=output[-3000:])
     except Exception as exc:
         update_job(job_id, status="failed", progress=100, error=str(exc))
 
